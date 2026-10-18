@@ -767,7 +767,14 @@ impl<T> Term<T> {
     /// Text moves up; clear at top
     /// Expects origin to be in scroll range.
     #[inline]
-    fn scroll_up_relative(&mut self, origin: Line, mut lines: usize) {
+    fn scroll_up_relative(&mut self, origin: Line, lines: usize) {
+        self.scroll_up_relative_clearing(origin, lines, true);
+    }
+
+    /// [`scroll_up_relative`](Self::scroll_up_relative); with `clear` off, one
+    /// line into a region of at least two, whose new line the caller overwrites
+    /// in full.
+    fn scroll_up_relative_clearing(&mut self, origin: Line, mut lines: usize, clear: bool) {
         trace!("Scrolling up relative: origin={origin}, lines={lines}");
 
         lines = cmp::min(lines, (self.scroll_region.end - self.scroll_region.start).0 as usize);
@@ -777,7 +784,11 @@ impl<T> Term<T> {
         // Scroll selection.
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
-        self.grid.scroll_up(&region, lines);
+        if clear {
+            self.grid.scroll_up(&region, lines);
+        } else {
+            self.grid.scroll_up_to_overwrite(&region);
+        }
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
@@ -1017,6 +1028,89 @@ impl<T> Term<T> {
         cursor_cell.extra = extra;
     }
 
+    /// Write printable ASCII at the cursor as `input` would char by char: one
+    /// row slice at a time, every cell from the cursor's template.
+    fn write_ascii_run(&mut self, run: &[u8])
+    where
+        T: EventListener,
+    {
+        let mut i = 0;
+        while i < run.len() {
+            if self.grid.cursor.input_needs_wrap {
+                if run.len() - i >= self.columns() {
+                    self.wrap_onto_a_line_to_fill();
+                } else {
+                    self.wrapline();
+                }
+            }
+            let columns = self.columns();
+            let column = self.grid.cursor.point.column.0;
+            let count = (columns - column).min(run.len() - i);
+            let line = self.grid.cursor.point.line;
+            // Overwriting half of a wide char also clears its other half; the
+            // char-by-char path knows how. Cells past `occ` are blank, as
+            // `Row::reset` already counts on, so a fresh line needs no look.
+            let row = &self.grid[line];
+            let occupied_end = (column + count).min(row.occ);
+            let wide_in_the_way = column < occupied_end
+                && row[Column(column)..Column(occupied_end)]
+                    .iter()
+                    .any(|cell| cell.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER));
+            if wide_in_the_way {
+                self.input(run[i] as char);
+                i += 1;
+                continue;
+            }
+            let template = self.grid.cursor.template.clone();
+            let row = &mut self.grid[line][Column(column)..Column(column + count)];
+            if template.extra.is_none() {
+                // Whole cells, so they go out as wide stores.
+                let (fg, bg, flags) = (template.fg, template.bg, template.flags);
+                for (cell, &byte) in row.iter_mut().zip(&run[i..i + count]) {
+                    *cell = Cell { c: byte as char, fg, bg, flags, extra: None };
+                }
+            } else {
+                for (cell, &byte) in row.iter_mut().zip(&run[i..i + count]) {
+                    cell.c = byte as char;
+                    cell.fg = template.fg;
+                    cell.bg = template.bg;
+                    cell.flags = template.flags;
+                    cell.extra = template.extra.clone();
+                }
+            }
+            let last = column + count - 1;
+            if last + 1 < columns {
+                self.grid.cursor.point.column = Column(last + 1);
+            } else {
+                self.grid.cursor.point.column = Column(last);
+                self.grid.cursor.input_needs_wrap = true;
+            }
+            i += count;
+        }
+    }
+
+    /// [`wrapline`](Self::wrapline) for a writer about to fill the whole next
+    /// line: when that line scrolls in at the bottom of the region it is left
+    /// uncleared, since every cell of it is written next.
+    fn wrap_onto_a_line_to_fill(&mut self)
+    where
+        T: EventListener,
+    {
+        let region = self.scroll_region.clone();
+        let scrolls = self.mode.contains(TermMode::LINE_WRAP)
+            && self.grid.cursor.point.line + 1 == region.end
+            && region.end - region.start >= 2;
+        if !scrolls {
+            self.wrapline();
+            return;
+        }
+        self.grid.cursor_cell().flags.insert(Flags::WRAPLINE);
+        self.scroll_up_relative_clearing(region.start, 1, false);
+        self.grid.cursor.point.column = Column(0);
+        self.grid.cursor.input_needs_wrap = false;
+        self.damage_cursor();
+    }
+
     #[inline]
     fn damage_cursor(&mut self) {
         // The normal cursor coordinates are always in viewport.
@@ -1134,6 +1228,27 @@ impl<T: EventListener> Handler for Term<T> {
             self.grid.cursor.point.column += 1;
         } else {
             self.grid.cursor.input_needs_wrap = true;
+        }
+    }
+
+    // Kept out of the parser's loop so the char-by-char `input` stays inlined there.
+    #[inline(never)]
+    fn input_ascii(&mut self, text: &str) {
+        // Insert mode shifts cells and a non-ASCII charset maps chars: both are
+        // the char-by-char path's.
+        let plain = !self.mode.contains(TermMode::INSERT)
+            && matches!(
+                self.grid.cursor.charsets[self.active_charset],
+                StandardCharset::Ascii
+            );
+        #[cfg(test)]
+        let plain = plain && ASCII_RUNS.with(|runs| runs.get());
+        if plain {
+            self.write_ascii_run(text.as_bytes());
+        } else {
+            for c in text.chars() {
+                self.input(c);
+            }
         }
     }
 
@@ -3298,5 +3413,111 @@ mod tests {
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Off: `input_ascii` inputs char by char, the reference the batch is held to.
+    static ASCII_RUNS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+mod ascii_run_equivalence {
+    use super::*;
+
+    use crate::event::VoidListener;
+    use crate::grid::Dimensions;
+    use crate::index::{Column, Line};
+    use crate::term::test::TermSize;
+    use crate::vte::ansi::{Processor, StdSyncHandler};
+
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Output that leans on everything the batch must get right: long ASCII,
+    /// wide and zero-width chars, styles, cursor moves, insert mode, the line
+    /// drawing charset, autowrap off, REP, DEL, C1 and invalid UTF-8.
+    fn stream(random: &mut Random, len: usize) -> Vec<u8> {
+        const PIECES: &[&[u8]] = &[
+            b"\r\n", b"\n", b"\t", b"\x08", b"\x7f", b" ",
+            "漢字かな".as_bytes(), "e\u{301}".as_bytes(), "🙂".as_bytes(), "│┼─".as_bytes(),
+            b"\x1b[1;31m", b"\x1b[0m", b"\x1b[38;2;10;20;30m", b"\x1b[7m",
+            b"\x1b[H", b"\x1b[5;10H", b"\x1b[3C", b"\x1b[2D", b"\x1b[A", b"\x1b[K", b"\x1b[2J",
+            b"\x1b[4h", b"\x1b[4l", b"\x1b(0", b"\x1b(B", b"\x1b[?7l", b"\x1b[?7h",
+            b"\x1b[3b", b"\x1b[2;8r", b"\x1b[r", b"\x1b[2@", b"\x1b[3P", b"\x1bM",
+            "\u{85}".as_bytes(), b"\xff", b"\xe2\x82",
+        ];
+        let mut out = Vec::new();
+        while out.len() < len {
+            if random.below(3) == 0 {
+                out.extend_from_slice(PIECES[random.below(PIECES.len() as u64) as usize]);
+            } else {
+                let word = 1 + random.below(60) as usize;
+                out.extend((0..word).map(|_| b' ' + random.below(95) as u8));
+            }
+        }
+        out
+    }
+
+    fn run(bytes: &[u8], chunks: &[usize], cols: usize, rows: usize, batch: bool) -> Term<VoidListener> {
+        ASCII_RUNS.with(|runs| runs.set(batch));
+        let mut term = Term::new(Config::default(), &TermSize::new(cols, rows), VoidListener);
+        let mut processor = Processor::<StdSyncHandler>::new();
+        let mut at = 0;
+        for &chunk in chunks.iter().cycle() {
+            if at >= bytes.len() {
+                break;
+            }
+            let end = (at + chunk).min(bytes.len());
+            processor.advance(&mut term, &bytes[at..end]);
+            at = end;
+        }
+        ASCII_RUNS.with(|runs| runs.set(true));
+        term
+    }
+
+    fn assert_same(batched: &Term<VoidListener>, reference: &Term<VoidListener>, seed: u64) {
+        assert_eq!(batched.grid.cursor.point, reference.grid.cursor.point, "cursor, seed {seed}");
+        assert_eq!(
+            batched.grid.cursor.input_needs_wrap, reference.grid.cursor.input_needs_wrap,
+            "wrap, seed {seed}"
+        );
+        assert_eq!(batched.history_size(), reference.history_size(), "history, seed {seed}");
+        let top = reference.grid.topmost_line().0;
+        let bottom = reference.grid.bottommost_line().0;
+        for line in top..=bottom {
+            for column in 0..reference.columns() {
+                let (a, b) = (&batched.grid[Line(line)][Column(column)], &reference.grid[Line(line)][Column(column)]);
+                assert_eq!(a, b, "cell {line},{column}, seed {seed}");
+            }
+        }
+    }
+
+    #[test]
+    fn batched_ascii_matches_char_by_char() {
+        for seed in 1..=400u64 {
+            let mut random = Random(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let len = 4_000 + random.below(20_000) as usize;
+            let bytes = stream(&mut random, len);
+            let chunks: Vec<usize> = (0..8).map(|_| 1 + random.below(3_000) as usize).collect();
+            let cols = 2 + random.below(120) as usize;
+            let rows = 1 + random.below(40) as usize;
+            let batched = run(&bytes, &chunks, cols, rows, true);
+            let reference = run(&bytes, &chunks, cols, rows, false);
+            assert_same(&batched, &reference, seed);
+        }
     }
 }

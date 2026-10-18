@@ -254,13 +254,42 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
-        // When rotating the entire region with fixed lines at the top, just reset everything.
-        if region.end - region.start <= positions && region.start != 0 {
+        if !self.rotate_up(region, positions) {
             for i in (region.start.0..region.end.0).map(Line::from) {
                 self.raw[i].reset(&self.cursor.template);
             }
-
             return;
+        }
+
+        // Ensure all new lines are fully cleared.
+        for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
+            self.raw[i].reset(&self.cursor.template);
+        }
+    }
+
+    /// [`scroll_up`](Self::scroll_up) one line into a region of at least two,
+    /// leaving the new bottom line as it was: for a caller that overwrites
+    /// every cell of it, so clearing it first is wasted.
+    pub fn scroll_up_to_overwrite<D>(&mut self, region: &Range<Line>)
+    where
+        T: ResetDiscriminant<D>,
+        D: PartialEq,
+    {
+        debug_assert!(region.end - region.start >= 2);
+        self.rotate_up(region, 1);
+    }
+
+    /// The rotation half of [`scroll_up`](Self::scroll_up). `false` when the
+    /// region is too small to rotate and only wants clearing.
+    #[inline]
+    fn rotate_up<D>(&mut self, region: &Range<Line>, positions: usize) -> bool
+    where
+        T: ResetDiscriminant<D>,
+        D: PartialEq,
+    {
+        // When rotating the entire region with fixed lines at the top, just reset everything.
+        if region.end - region.start <= positions && region.start != 0 {
+            return false;
         }
 
         // Update display offset when not pinned to active area.
@@ -300,10 +329,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             }
         }
 
-        // Ensure all new lines are fully cleared.
-        for i in (region.end.0 - positions as i32..region.end.0).map(Line::from) {
-            self.raw[i].reset(&self.cursor.template);
-        }
+        true
     }
 
     pub fn clear_viewport<D>(&mut self)
