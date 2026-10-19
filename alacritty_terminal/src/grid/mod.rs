@@ -1,6 +1,7 @@
 //! A specialized 2D grid implementation optimized for use in a terminal.
 
 use std::cmp::{max, min};
+use std::mem;
 use std::ops::{Bound, Deref, Index, IndexMut, Range, RangeBounds};
 
 #[cfg(feature = "serde")]
@@ -17,6 +18,9 @@ mod storage;
 mod tests;
 
 pub use self::row::Row;
+
+/// Most rows [`Grid::recycle_rows`] keeps for reuse.
+const MAX_SPARE_ROWS: usize = 64;
 use self::storage::Storage;
 
 pub trait GridCell: Sized {
@@ -135,6 +139,20 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    /// Rows that left history for good since the last [`Grid::take_evicted`],
+    /// oldest first; `None` while nobody collects them.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    evicted: Option<Vec<Row<T>>>,
+
+    /// Rows handed back by the collector, reused in place of new ones.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    spare_rows: Vec<Row<T>>,
+
+    /// How many times history was cleared, so a collector of evicted rows
+    /// knows to drop what it holds.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    history_clears: u64,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -142,12 +160,39 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         Grid {
             raw: Storage::with_capacity(lines, columns),
             max_scroll_limit,
+            evicted: None,
+            spare_rows: Vec::new(),
+            history_clears: 0,
             display_offset: 0,
             saved_cursor: Cursor::default(),
             cursor: Cursor::default(),
             lines,
             columns,
         }
+    }
+
+    /// Keep the rows that scroll out of history for good, for
+    /// [`take_evicted`](Self::take_evicted); off drops any still held.
+    pub fn collect_evicted(&mut self, on: bool) {
+        self.evicted = on.then(Vec::new);
+    }
+
+    /// The rows that left history since the last call, oldest first.
+    pub fn take_evicted(&mut self) -> Vec<Row<T>> {
+        self.evicted.as_mut().map(mem::take).unwrap_or_default()
+    }
+
+    /// Hand rows from [`take_evicted`](Self::take_evicted) back for reuse,
+    /// saving an allocation per evicted row.
+    pub fn recycle_rows(&mut self, rows: impl IntoIterator<Item = Row<T>>) {
+        let columns = self.columns;
+        let room = MAX_SPARE_ROWS.saturating_sub(self.spare_rows.len());
+        self.spare_rows.extend(rows.into_iter().filter(|row| row.len() == columns).take(room));
+    }
+
+    /// How many times history has been cleared.
+    pub fn history_clears(&self) -> u64 {
+        self.history_clears
     }
 
     /// Update the size of the scrollback history.
@@ -299,6 +344,21 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Only rotate the entire history if the active region starts at the top.
         if region.start == 0 {
+            // At the limit, the oldest rows leave history for good: hand them
+            // to the collector, leaving fresh rows for the rotation to reuse.
+            if let Some(evicted) = self.evicted.as_mut() {
+                let history = self.raw.len() - self.lines;
+                let gone = positions.saturating_sub(self.max_scroll_limit - history).min(history);
+                let top = -(history as i32);
+                for line in (top..top + gone as i32).map(Line::from) {
+                    let fresh = match self.spare_rows.pop() {
+                        Some(row) if row.len() == self.columns => row,
+                        _ => Row::new(self.columns),
+                    };
+                    evicted.push(mem::replace(&mut self.raw[line], fresh));
+                }
+            }
+
             // Create scrollback for the new lines.
             self.increase_scroll_limit(positions);
 
@@ -407,6 +467,12 @@ impl<T> Grid<T> {
 
     #[inline]
     pub fn clear_history(&mut self) {
+        // Rows evicted before the clear were history too.
+        if let Some(evicted) = self.evicted.as_mut() {
+            evicted.clear();
+        }
+        self.history_clears += 1;
+
         // Explicitly purge all lines from history.
         self.raw.shrink_lines(self.history_size());
 

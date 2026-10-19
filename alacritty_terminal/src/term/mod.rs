@@ -651,6 +651,21 @@ impl<T> Term<T> {
         &mut self.grid
     }
 
+    /// The grid with scrollback: the active one, or the inactive one while the
+    /// alternate screen is up.
+    pub fn primary_grid(&self) -> &Grid<Cell> {
+        if self.mode.contains(TermMode::ALT_SCREEN) { &self.inactive_grid } else { &self.grid }
+    }
+
+    /// Mutable [`primary_grid`](Self::primary_grid).
+    pub fn primary_grid_mut(&mut self) -> &mut Grid<Cell> {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            &mut self.inactive_grid
+        } else {
+            &mut self.grid
+        }
+    }
+
     /// Resize terminal to new dimensions.
     pub fn resize<S: Dimensions>(&mut self, size: S) {
         let old_cols = self.columns();
@@ -2632,6 +2647,80 @@ mod tests {
     use crate::term::cell::{Cell, Flags};
     use crate::term::test::TermSize;
     use crate::vte::ansi::{self, CharsetIndex, Handler, StandardCharset};
+
+    fn first_chars(rows: &[crate::grid::Row<Cell>]) -> String {
+        rows.iter().map(|row| row[Column(0)].c).collect()
+    }
+
+    #[test]
+    fn evicted_rows_come_out_oldest_first() {
+        let size = TermSize::new(5, 3);
+        let config = Config { scrolling_history: 2, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        term.primary_grid_mut().collect_evicted(true);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // Three screen rows and two of history hold `c` to `g`; `a` and `b`
+        // scrolled out past the limit.
+        parser.advance(&mut term, b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng");
+        assert_eq!(first_chars(&term.primary_grid_mut().take_evicted()), "ab");
+        assert!(term.primary_grid_mut().take_evicted().is_empty());
+
+        // The alternate screen scrolls without history: nothing is collected,
+        // and the primary grid keeps collecting underneath it.
+        parser.advance(&mut term, b"\x1b[?1049h1\r\n2\r\n3\r\n4\r\n5");
+        assert!(term.primary_grid_mut().take_evicted().is_empty());
+        parser.advance(&mut term, b"\x1b[?1049l\r\nh\r\ni");
+        assert_eq!(first_chars(&term.primary_grid_mut().take_evicted()), "cd");
+
+        // A clear drops rows still pending and counts.
+        let clears = term.primary_grid().history_clears();
+        parser.advance(&mut term, b"\r\nj\x1b[3J");
+        assert!(term.primary_grid_mut().take_evicted().is_empty());
+        assert_eq!(term.primary_grid().history_clears(), clears + 1);
+    }
+
+    #[test]
+    fn rewrapped_rows_past_the_limit_are_evicted() {
+        let size = TermSize::new(4, 2);
+        let config = Config { scrolling_history: 2, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        term.primary_grid_mut().collect_evicted(true);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        // Four rows fit: two of history, two on screen.
+        parser.advance(&mut term, b"ab\r\ncd\r\nef\r\ngh");
+        assert!(term.primary_grid_mut().take_evicted().is_empty());
+
+        // At two columns nothing wraps, at one column every row doubles; the
+        // rows the limit no longer holds come out oldest first.
+        term.resize(TermSize::new(2, 2));
+        assert!(term.primary_grid_mut().take_evicted().is_empty());
+        term.grid_mut().resize(true, 2, 1);
+        let evicted = term.primary_grid_mut().take_evicted();
+        assert_eq!(first_chars(&evicted), "abcd");
+    }
+
+    #[test]
+    fn recycled_rows_replace_evicted_ones() {
+        let size = TermSize::new(5, 3);
+        let config = Config { scrolling_history: 2, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        term.primary_grid_mut().collect_evicted(true);
+        let mut parser: ansi::Processor = ansi::Processor::new();
+
+        parser.advance(&mut term, b"a\r\nb\r\nc\r\nd\r\ne\r\nf");
+        let evicted = term.primary_grid_mut().take_evicted();
+        assert_eq!(first_chars(&evicted), "a");
+        term.primary_grid_mut().recycle_rows(evicted);
+
+        // The reused row comes back cleared: nothing of `a` shows.
+        parser.advance(&mut term, b"\r\ng");
+        assert_eq!(first_chars(&term.primary_grid_mut().take_evicted()), "b");
+        assert_eq!(term.grid()[Line(2)][Column(0)].c, 'g');
+        let screen: String = (-2..3).map(|line| term.grid()[Line(line)][Column(0)].c).collect();
+        assert_eq!(screen, "cdefg");
+    }
 
     #[test]
     fn scroll_display_page_up() {

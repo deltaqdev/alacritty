@@ -122,6 +122,12 @@ impl<T> Row<T> {
         self.inner.len()
     }
 
+    /// Cells from here on all equal the template of the row's last reset.
+    #[inline]
+    pub fn occupied(&self) -> usize {
+        self.occ.min(self.inner.len())
+    }
+
     #[inline]
     pub fn last(&self) -> Option<&T> {
         self.inner.last()
