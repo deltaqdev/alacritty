@@ -14,7 +14,7 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener};
-use crate::grid::{Dimensions, Grid, GridIterator, Scroll};
+use crate::grid::{Dimensions, Grid, GridChange, GridIterator, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
 use crate::term::cell::{Cell, Flags, LineLength};
@@ -725,6 +725,28 @@ impl<T> Term<T> {
         &self.mode
     }
 
+    /// Record scrolls and clears on both screens ([`Grid::record_changes`]).
+    pub fn record_grid_changes(&mut self, record: bool) {
+        self.grid.record_changes(record);
+        self.inactive_grid.record_changes(record);
+    }
+
+    /// Append each screen's changes recorded since the last call: the primary
+    /// screen's to `primary`, the alternate screen's to `alternate`.
+    pub fn take_grid_changes(
+        &mut self,
+        primary: &mut Vec<GridChange>,
+        alternate: &mut Vec<GridChange>,
+    ) {
+        let (primary_grid, alternate_grid) = if self.mode.contains(TermMode::ALT_SCREEN) {
+            (&mut self.inactive_grid, &mut self.grid)
+        } else {
+            (&mut self.grid, &mut self.inactive_grid)
+        };
+        primary_grid.take_changes(primary);
+        alternate_grid.take_changes(alternate);
+    }
+
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
         if !self.mode.contains(TermMode::ALT_SCREEN) {
@@ -736,6 +758,7 @@ impl<T> Term<T> {
 
             // Reset alternate screen contents.
             self.inactive_grid.reset_region(..);
+            self.inactive_grid.record_change(GridChange::Clear);
         }
 
         mem::swap(&mut self.keyboard_mode_stack, &mut self.inactive_keyboard_mode_stack);
@@ -825,6 +848,7 @@ impl<T> Term<T> {
 
         // Clear grid.
         self.grid.reset_region(..);
+        self.grid.record_change(GridChange::Clear);
         self.mark_fully_damaged();
     }
 
@@ -1918,10 +1942,12 @@ impl<T: EventListener> Handler for Term<T> {
             ansi::ClearMode::All => {
                 if self.mode.contains(TermMode::ALT_SCREEN) {
                     self.grid.reset_region(..);
+                    self.grid.record_change(GridChange::Clear);
                 } else {
                     let old_offset = self.grid.display_offset();
 
                     self.grid.clear_viewport();
+                    self.grid.record_change(GridChange::Clear);
 
                     // Compute number of lines scrolled by clearing the viewport.
                     let lines = self.grid.display_offset().saturating_sub(old_offset);
@@ -2720,6 +2746,55 @@ mod tests {
         assert_eq!(term.grid()[Line(2)][Column(0)].c, 'g');
         let screen: String = (-2..3).map(|line| term.grid()[Line(line)][Column(0)].c).collect();
         assert_eq!(screen, "cdefg");
+    }
+
+    #[test]
+    fn grid_changes_record_scrolls_and_clears_per_screen() {
+        let size = TermSize::new(5, 3);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let (mut primary, mut alternate) = (Vec::new(), Vec::new());
+
+        // Off by default: nothing is recorded.
+        for _ in 0..3 {
+            term.newline();
+        }
+        term.take_grid_changes(&mut primary, &mut alternate);
+        assert!(primary.is_empty() && alternate.is_empty());
+
+        // A run of one-line scrolls in one region is one entry.
+        term.record_grid_changes(true);
+        for _ in 0..4 {
+            term.newline();
+        }
+        term.goto(0, 0);
+        term.reverse_index();
+        term.take_grid_changes(&mut primary, &mut alternate);
+        let region = Line(0)..Line(3);
+        assert_eq!(primary, vec![
+            GridChange::Scroll { region: region.clone(), delta: 4 },
+            GridChange::Scroll { region, delta: -1 },
+        ]);
+        assert!(alternate.is_empty());
+
+        // A clear scrolls what it can into the history, then resets the screen.
+        primary.clear();
+        term.clear_screen(ansi::ClearMode::All);
+        term.take_grid_changes(&mut primary, &mut alternate);
+        assert_eq!(primary.last(), Some(&GridChange::Clear));
+
+        // Entering the alternate screen clears it; a clear there resets in place.
+        primary.clear();
+        term.set_private_mode(ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor.into());
+        term.clear_screen(ansi::ClearMode::All);
+        term.take_grid_changes(&mut primary, &mut alternate);
+        assert!(primary.is_empty());
+        assert_eq!(alternate, vec![GridChange::Clear, GridChange::Clear]);
+
+        // Off again: nothing more is recorded.
+        term.record_grid_changes(false);
+        term.newline();
+        term.take_grid_changes(&mut primary, &mut alternate);
+        assert_eq!(alternate.len(), 2);
     }
 
     #[test]

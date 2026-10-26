@@ -23,6 +23,21 @@ pub use self::row::Row;
 const MAX_SPARE_ROWS: usize = 64;
 use self::storage::Storage;
 
+/// A change to which lines hold what, for an embedder that anchors its own
+/// content (such as images) to lines. Recorded only while
+/// [`Grid::record_changes`] is on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GridChange {
+    /// The lines of `region` moved up by `delta` lines, down when negative. With
+    /// the region at the top of the screen, the lines moved above it entered the
+    /// history, and the history moved up with them.
+    Scroll { region: Range<Line>, delta: i32 },
+    /// Every visible line was reset in place: a clear screen (after the lines
+    /// it scrolled into the history), entering the alternate screen, or a
+    /// terminal reset.
+    Clear,
+}
+
 pub trait GridCell: Sized {
     /// Check if the cell contains any content.
     fn is_empty(&self) -> bool;
@@ -153,6 +168,10 @@ pub struct Grid<T> {
     /// knows to drop what it holds.
     #[cfg_attr(feature = "serde", serde(skip))]
     history_clears: u64,
+
+    /// Scrolls and clears recorded for [`Grid::take_changes`], while on.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    changes: Option<Vec<GridChange>>,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -168,6 +187,22 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             cursor: Cursor::default(),
             lines,
             columns,
+            changes: None,
+        }
+    }
+
+    /// Record scrolls and clears for [`take_changes`](Self::take_changes). Off
+    /// by default, and off costs nothing.
+    pub fn record_changes(&mut self, record: bool) {
+        if record != self.changes.is_some() {
+            self.changes = if record { Some(Vec::new()) } else { None };
+        }
+    }
+
+    /// Append the changes recorded since the last call to `into`, oldest first.
+    pub fn take_changes(&mut self, into: &mut Vec<GridChange>) {
+        if let Some(changes) = self.changes.as_mut() {
+            into.append(changes);
         }
     }
 
@@ -238,6 +273,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        self.record_scroll(region, -(positions as i32));
+
         // When rotating the entire region, just reset everything.
         if region.end - region.start <= positions {
             for i in (region.start.0..region.end.0).map(Line::from) {
@@ -299,6 +336,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        self.record_scroll(region, positions as i32);
+
         if !self.rotate_up(region, positions) {
             for i in (region.start.0..region.end.0).map(Line::from) {
                 self.raw[i].reset(&self.cursor.template);
@@ -321,6 +360,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         D: PartialEq,
     {
         debug_assert!(region.end - region.start >= 2);
+        self.record_scroll(region, 1);
         self.rotate_up(region, 1);
     }
 
@@ -425,6 +465,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         D: PartialEq,
     {
         self.clear_history();
+        self.record_change(GridChange::Clear);
 
         self.saved_cursor = Cursor::default();
         self.cursor = Cursor::default();
@@ -439,6 +480,29 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 }
 
 impl<T> Grid<T> {
+    /// Record `change` while recording is on.
+    pub(crate) fn record_change(&mut self, change: GridChange) {
+        if let Some(changes) = self.changes.as_mut() {
+            changes.push(change);
+        }
+    }
+
+    fn record_scroll(&mut self, region: &Range<Line>, delta: i32) {
+        let Some(changes) = self.changes.as_mut() else {
+            return;
+        };
+        // Output scrolls a line at a time; one entry per run keeps a flood short.
+        if let Some(GridChange::Scroll { region: last_region, delta: last_delta }) =
+            changes.last_mut()
+        {
+            if last_region == region && last_delta.signum() == delta.signum() {
+                *last_delta = last_delta.saturating_add(delta);
+                return;
+            }
+        }
+        changes.push(GridChange::Scroll { region: region.clone(), delta });
+    }
+
     /// Reset a visible region within the grid.
     pub fn reset_region<D, R: RangeBounds<Line>>(&mut self, bounds: R)
     where
