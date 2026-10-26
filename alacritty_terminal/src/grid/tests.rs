@@ -253,6 +253,45 @@ fn shrink_reflow_empty_cell_inside_line() {
 }
 
 #[test]
+fn shrink_reflow_fills_blank_lines_below_cursor() {
+    let mut grid = Grid::<Cell>::new(4, 5, 10);
+    for (column, c) in "12345".chars().enumerate() {
+        grid[Line(0)][Column(column)] = cell(c);
+    }
+    grid[Line(1)][Column(0)] = cell('>');
+    grid.cursor.point = Point::new(Line(1), Column(1));
+
+    grid.resize(true, 4, 3);
+
+    assert_eq!(grid.history_size(), 0);
+    assert_eq!(grid[Line(0)][Column(0)], cell('1'));
+    assert_eq!(grid[Line(0)][Column(2)], wrap_cell('3'));
+    assert_eq!(grid[Line(1)][Column(0)], cell('4'));
+    assert_eq!(grid[Line(1)][Column(1)], cell('5'));
+    assert_eq!(grid[Line(2)][Column(0)], cell('>'));
+    assert_eq!(grid.cursor.point, Point::new(Line(2), Column(1)));
+    assert!(grid[Line(3)].is_clear());
+}
+
+#[test]
+fn shrink_reflow_without_blank_lines_below_cursor_fills_history() {
+    let mut grid = Grid::<Cell>::new(2, 5, 10);
+    for (column, c) in "12345".chars().enumerate() {
+        grid[Line(0)][Column(column)] = cell(c);
+    }
+    grid[Line(1)][Column(0)] = cell('>');
+    grid.cursor.point = Point::new(Line(1), Column(1));
+
+    grid.resize(true, 2, 3);
+
+    assert_eq!(grid.history_size(), 1);
+    assert_eq!(grid[Line(-1)][Column(0)], cell('1'));
+    assert_eq!(grid[Line(0)][Column(0)], cell('4'));
+    assert_eq!(grid[Line(1)][Column(0)], cell('>'));
+    assert_eq!(grid.cursor.point, Point::new(Line(1), Column(1)));
+}
+
+#[test]
 fn grow_reflow() {
     let mut grid = Grid::<Cell>::new(2, 2, 0);
     grid[Line(0)][Column(0)] = cell('1');

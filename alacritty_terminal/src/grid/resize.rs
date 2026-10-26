@@ -251,10 +251,18 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             self.cursor.point.column += 1;
         }
 
+        // Blank rows below the cursor take the lines rewrapping adds, so the content above
+        // them stays on screen instead of going into history.
+        let blank_below = (self.cursor.point.line.0 + 1..self.lines as i32)
+            .rev()
+            .take_while(|&line| self[Line(line)].is_clear())
+            .count();
+
         let mut new_raw = Vec::with_capacity(self.raw.len());
         let mut buffered: Option<Vec<T>> = None;
 
         let mut rows = self.raw.take_all();
+        let old_len = rows.len();
         for (i, mut row) in rows.drain(..).enumerate().rev() {
             // Append lines left over from the previous row.
             if let Some(buffered) = buffered.take() {
@@ -365,6 +373,18 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Reverse iterator and use it as the new grid storage.
         let mut reversed: Vec<Row<T>> = new_raw.drain(..).rev().collect();
+
+        // Drop as many of the blank rows at the bottom as rewrapping added lines.
+        let added = reversed.len().saturating_sub(old_len);
+        let absorbed =
+            reversed.iter().take(min(added, blank_below)).take_while(|row| row.is_clear()).count();
+        if absorbed > 0 {
+            reversed.drain(..absorbed);
+            self.cursor.point.line =
+                min(self.cursor.point.line + absorbed, Line(self.lines as i32 - 1));
+            self.display_offset = self.display_offset.saturating_sub(absorbed);
+        }
+
         // Rows rewrapping pushed past the history limit leave it for good.
         if let Some(evicted) = self.evicted.as_mut() {
             let keep = self.max_scroll_limit + self.lines;
